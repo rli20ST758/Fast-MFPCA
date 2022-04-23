@@ -12,8 +12,8 @@ library(rARPACK)
 library(dplyr)
 
 source("GeneData.R")
-source("backup.R")
-source("mfpca.face.R")
+# source("face.Cov.mfpca.R")
+# source("mfpca.face.R")
 
 ## set parameters
 I <- 100

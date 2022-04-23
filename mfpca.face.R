@@ -1,37 +1,156 @@
-#' This function performs fast MFPCA on multilevel functional data
+#' Multilevel functional principal components analysis with fast covariance estimation
 #' 
-#' @param Y a multilevel functional dataset on a regular grid stored in a matrix. Missingness is allowed.
-#' @param id a vector containing the id information
-#' @param group a vector containing information used to identify groups/visits
-#' @param twoway logical, indicating whether to carry out twoway ANOVA and calculate visit-specific means. Defaults to \code{TRUE}.
-#' @param weight the way of calculating covariance, "obs" indicating that the sample covariance is weighted by observations and "subj" indicating that the sample covariance is weighted equally by subjects. Defaults to \code{"obs"}.
-#' @param argvals a vector containing observed locations on the functional domain
-#' @param pve proportion of variance explained: used to choose the number of principal components
-#' @param npc prespecified value for the number of principal components (if given, this overrides \code{pve})
-#' @param p integer; the degree of B-splines functions to use
-#' @param m integer; the order of difference penalty to use
-#' @param knots number of knots to use or the vectors of knots; defaults to 35
-#' @param silent whether to not print the name of each step; defaults to \code{TRUE}.
+#' Decompose dense or sparse multilevel functional observations using multilevel 
+#' functional principal component analysis with the fast covariance estimation 
+#' approach. 
+#' 
+#' The fast MFPCA approach (Cui et al., 2022+) uses FACE (Xiao et al., 2016) to estimate 
+#' covariance functions and mixed model equations (MME) to predict 
+#' scores for each level. As a result, it has lower computational complexity than 
+#' MFPCA (Di et al., 2009) implemented in the \code{mfpca.sc} function, and
+#' can be applied to decompose data sets with over 10000 subjects and over 10000 
+#' dimensions.
+#' 
+#' 
+#' @param Y A multilevel functional dataset on a regular grid stored in a matrix.
+#' Each row of the data is the functional observations at one visit for one subject.
+#' Missingness is allowed and need to be labeled as NA. The data must be specified.
+#' @param id A vector containing the id information to identify the subjects. The
+#' data must be specified.
+#' @param visit A vector containing information used to identify the visits. 
+#' If not provided, assume the visit id are 1,2,... for each subject.
+#' @param twoway Logical, indicating whether to carry out twoway ANOVA and 
+#' calculate visit-specific means. Defaults to \code{TRUE}.
+#' @param weight The way of calculating covariance. \code{weight = "obs"} indicates
+#' that the sample covariance is weighted by observations. \code{weight = "subj"} 
+#' indicates that the sample covariance is weighted equally by subjects. Defaults to \code{"obs"}.
+#' @param argvals A vector containing observed locations on the functional domain.
+#' @param pve Proportion of variance explained. This value is used to choose the 
+#' number of principal components for both levels.
+#' @param npc Pre-specified value for the number of principal components. 
+#' If given, this overrides \code{pve}.
+#' @param p The degree of B-splines functions to use. Defaults to 3.
+#' @param m The order of difference penalty to use. Defaults to 2.
+#' @param knots Number of knots to use or the vectors of knots. Defaults to 35.
+#' @param silent Logical, indicating whether to not display the name of each step.
+#' Defaults to \code{TRUE}.
+#' 
+#' @return A list containing:
+#' \item{Xhat}{FPC approximation (projection onto leading components)
+#' of \code{Y}, estimated curves for all subjects and visits}
+#' \item{Xhat.subject}{Estimated subject specific curves for all subjects}
+#' \item{Y}{The observed data}
+#' \item{mu}{estimated mean function (or a vector of zeroes if \code{center==FALSE}).} 
+#' \item{eta}{The estimated visit specific shifts from overall mean.}
+#' \item{scores}{A matrix of estimated FPC scores for level1 and level2.} 
+#' \item{efunctions}{A matrix of estimated eigenfunctions of the functional
+#' covariance, i.e., the FPC basis functions for levels 1 and 2.} 
+#' \item{evalues}{Estimated eigenvalues of the covariance operator, i.e., variances 
+#' of FPC scores for levels 1 and 2.}
+#' \item{npc}{Number of FPCs: either the supplied \code{npc}, or the minimum
+#' number of basis functions needed to explain proportion \code{pve} of the
+#' variance in the observed curves for levels 1 and 2.} 
+#' \item{sigma2}{Estimated measurement error variance.} 
+#' 
+#' @author Ruonan Li \email{rli20@@ncsu.edu}, Erjia Cui \email{ecui1@@jhmi.edu}
+#' 
+#' @references Cui, E., Li, R., Crainiceanu, C., and Xiao, L. (2022+). Fast multilevel
+#' functional principal component analysis.
+#' 
+#' Di, C., Crainiceanu, C., Caffo, B., and Punjabi, N. (2009).
+#' Multilevel functional principal component analysis. \emph{Annals of Applied
+#' Statistics}, 3, 458--488.
+#' 
+#' Xiao, L., Ruppert, D., Zipunnikov, V., and Crainiceanu, C. (2016).
+#' Fast covariance estimation for high-dimensional functional data.  
+#' \emph{Statistics and Computing}, 26, 409-421.
 #' 
 #' @export
-#' @import refund
-#' @import splines
-#' @import mgcv
-#' @import MASS
-#' @import simex
-#' @import Matrix
+#' @importFrom splines spline.des
+#' @importFrom mgcv s smooth.construct gam predict.gam
+#' @importFrom MASS ginv
+#' @importFrom Matrix crossprod
+#' @importFrom stats smooth.spline optim
+#' 
+#' 
+#' @examples 
+#' data(DTI)
+#' mfpca.DTI <- mfpca.face(Y = DTI$cca, id = DTI$ID, twoway = TRUE)
 
-mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argvals = NULL,
+mfpca.face <- function(Y, id, visit = NULL, twoway = TRUE, weight = "obs", argvals = NULL,
                         pve = 0.99, npc = NULL, p = 3, m = 2, knots = 35, silent = TRUE){
-  ## load required packages manually
-  library(refund)
-  library(splines)
-  library(mgcv)
-  library(MASS)
-  library(simex)
-  library(Matrix)
-  #source("./code/backup.R")
   
+  pspline.setting.mfpca <- function(x,knots=35,p=3,m=2,weight=NULL,type="full",
+                                    knots.option="equally-spaced"){
+    # x: the marginal data points
+    # knots: the list of interior knots or the numbers of interior knots
+    # p: degrees for B-splines, with defaults values 3
+    # m: orders of difference penalty, with default values 2
+    # knots.option: type of knots placement, with default values "equally-spaced"
+    
+    #require(splines)
+    #require(Matrix)
+    
+    ### design matrix 
+    K = length(knots)-2*p-1
+    B = spline.des(knots=knots, x=x, ord=p+1, outer.ok=TRUE,sparse=TRUE)$design
+    
+    bs = "ps"
+    
+    if(knots.option == "quantile"){
+      bs = "bs"
+    }
+    
+    s.object = s(x=x, bs=bs, k=K+p, m=c(p-1,2), sp=NULL)
+    object  = smooth.construct(s.object,data = data.frame(x=x),knots=list(x=knots))
+    P =  object$S[[1]]
+    if(knots.option == "quantile") P = P / max(abs(P))*10 # rescaling
+    
+    if(is.null(weight)) weight <- rep(1,length(x))
+    
+    if(type=="full"){
+      
+      Sig = crossprod(matrix.multiply.mfpca(B,weight,option=2),B)
+      eSig = eigen(Sig)
+      V = eSig$vectors
+      E = eSig$values
+      if(min(E)<=0.0000001) {#cat("Warning! t(B)%*%B is singular!\n");
+        #cat("A small identity matrix is added!\n");
+        E <- E + 0.000001;
+      }
+      Sigi_sqrt = matrix.multiply.mfpca(V,1/sqrt(E))%*%t(V)
+      
+      tUPU = Sigi_sqrt%*%(P%*%Sigi_sqrt)
+      Esig = eigen(tUPU,symmetric=TRUE)
+      U = Esig$vectors
+      s = Esig$values
+      s[(K+p-m+1):(K+p)]=0
+      A = B%*%(Sigi_sqrt%*%U)
+    }
+    
+    if(type=="simple"){
+      A = NULL
+      s = NULL
+      Sigi_sqrt = NULL
+      U = NULL
+    }
+    
+    List = list("A" = A, "B" = B, "s" = s, "Sigi.sqrt" = Sigi_sqrt, "U" = U, "P" = P)
+    
+    return(List)
+  }
+  
+  ## a function supposed to be in the refund package
+  quadWeights.mfpca <- function(argvals, method = "trapezoidal")
+  {
+    ret <- switch(method,
+                  trapezoidal = {D <- length(argvals)
+                  1/2*c(argvals[2] - argvals[1], argvals[3:D] -argvals[1:(D-2)], argvals[D] - argvals[D-1])},
+                  midpoint = c(0,diff(argvals)),
+                  stop("function quadWeights: choose either trapezoidal or midpoint quadrature rule"))
+    
+    return(ret)  
+  }
   
   ##################################################################################
   ## Organize the input
@@ -41,23 +160,23 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   stopifnot((!is.null(Y) & !is.null(id)))
   stopifnot(is.matrix(Y))
   
-  ## specify group variable if not provided
-  if (!is.null(group)){ 
-    group <- as.factor(group)
-  }else{ ## if group is not provided, assume the group id are 1,2,... for each subject
-    group <- as.factor(ave(id, id, FUN=seq_along))
+  ## specify visit variable if not provided
+  if (!is.null(visit)){ 
+    visit <- as.factor(visit)
+  }else{ ## if visit is not provided, assume the visit id are 1,2,... for each subject
+    visit <- as.factor(ave(id, id, FUN=seq_along))
   }
   id <- as.factor(id) ## convert id into a factor
   
   ## organize data into one data frame
-  df <- data.frame(id = id, group = group, Y = I(Y))
-  rm(id, group, Y)
+  df <- data.frame(id = id, visit = visit, Y = I(Y))
+  rm(id, visit, Y)
   
   ## derive several variables that will be used later
-  J <- length(levels(df$group)) ## number of groups
+  J <- length(levels(df$visit)) ## number of visits
   L <- ncol(df$Y) ## number of observations along the domain
-  nGroups <- data.frame(table(df$id))  ## calculate number of groups for each subject
-  colnames(nGroups) = c("id", "numGroups")
+  nVisits <- data.frame(table(df$id))  ## calculate number of visits for each subject
+  colnames(nVisits) = c("id", "numVisits")
   ID = sort(unique(df$id)) ## id of each subject
   I <- length(ID) ## number of subjects
   ## assume observations are equally-spaced on [0,1] if not specified
@@ -65,9 +184,9 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   
   
   ##################################################################################
-  ## Estimate population mean function (mu) and group-specific mean function (eta)
+  ## Estimate population mean function (mu) and visit-specific mean function (eta)
   ##################################################################################
-  if(silent == FALSE) print("Estimate population and group-specific mean functions")
+  if(silent == FALSE) print("Estimate population and visit-specific mean functions")
   
   meanY <- colMeans(df$Y, na.rm = TRUE)
   fit_mu <- gam(meanY ~ s(argvals))
@@ -76,11 +195,11 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   
   mueta = matrix(0, L, J) 
   eta = matrix(0, L, J) ## matrix to store visit-specific means
-  colnames(mueta) <- colnames(eta) <- levels(df$group)
+  colnames(mueta) <- colnames(eta) <- levels(df$visit)
   Ytilde <- matrix(NA, nrow = nrow(df$Y), ncol = ncol(df$Y))
   if(twoway==TRUE) {
     for(j in 1:J) {
-      ind_j <- which(df$group == levels(df$group)[j])
+      ind_j <- which(df$visit == levels(df$visit)[j])
       if(length(ind_j) > 1){
         meanYj <- colMeans(df$Y[ind_j,], na.rm=TRUE)
       }else{
@@ -119,8 +238,8 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   c.p <- K.p + p #the number of B-spline basis functions
   
   ## Precalculation for smoothing
-  List <- pspline.setting(argvals, knots, p, m)
-  B <- List$B #B is the J ×c design matrix
+  List <- pspline.setting.mfpca(argvals, knots, p, m)
+  B <- List$B #B is the J by c design matrix
   Sigi.sqrt <- List$Sigi.sqrt #(t(B)B)^(-1/2)
   s <- List$s #eigenvalues of Sigi_sqrt%*%(P%*%Sigi_sqrt)
   U <- List$U #eigenvectors of Sigi_sqrt%*%(P%*%Sigi_sqrt)
@@ -140,14 +259,14 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   
   Ji <- as.numeric(table(df$id))
   diagD <- rep(Ji, Ji)
-  smooth.Gt = face.Cov(Y=unclass(df$Ytilde), argvals, A0, B, Anew, Bnew, G_invhalf, s)
+  smooth.Gt = face.Cov.mfpca(Y=unclass(df$Ytilde), argvals, A0, B, Anew, Bnew, G_invhalf, s)
   ## impute missing data of Y using FACE approach
   if(sum(is.na(df$Ytilde))>0){
     df$Ytilde[which(is.na(df$Ytilde))] <- smooth.Gt$Yhat[which(is.na(df$Ytilde))]
   }
   if(weight=="subj"){
     YH <- unclass(df$Ytilde)*sqrt(nrow(df$Ytilde)/(I*diagD))
-    smooth.Gt <- face.Cov(Y=YH, argvals, A0, B, Anew, Bnew, G_invhalf, s)
+    smooth.Gt <- face.Cov.mfpca(Y=YH, argvals, A0, B, Anew, Bnew, G_invhalf, s)
     rm(YH)
   }
   diag_Gt <- colMeans(df$Ytilde^2)
@@ -172,8 +291,13 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
       if(Ji[x]>1) return((weights/sqrt(Ji[x]-1)) * t(t(df$Ytilde[inx_row_ls[[x]],,drop=FALSE]) - Ysubm[x,]/Ji[x]))
     }))
   }
-  smooth.Gw <- face.Cov(Y=YR, argvals, A0, B, Anew, Bnew, G_invhalf, s)
-  rm(Ji, diagD, inx_row_ls, weights, weight, Ysubm, YR, B, Anew, G_invhalf, s)
+  smooth.Gw <- face.Cov.mfpca(Y=YR, argvals, A0, B, Anew, Bnew, G_invhalf, s)
+  sigma.Gw <- smooth.Gw$evalues # raw eigenvalues of Gw
+  per <- cumsum(sigma.Gw)/sum(sigma.Gw)
+  N.Gw <- ifelse (is.null(npc), min(which(per>pve)), min(npc, length(sigma.Gw)))
+  smooth.Gw$efunctions <- smooth.Gw$efunctions[,1:N.Gw]
+  smooth.Gw$evalues <- smooth.Gw$evalues[1:N.Gw]
+  rm(Ji, diagD, inx_row_ls, weights, weight, Ysubm, YR, B, Anew, G_invhalf, s, per, N.Gw, sigma.Gw)
   
   
   ##################################################################################
@@ -187,9 +311,10 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   d <- Sigma[1:c.p]
   d <- d[d>0]
   per <- cumsum(d)/sum(d)
-  N <- ifelse (is.null(npc), min(which(per>pve)), min(npc, length(d)))
-  smooth.Gb <- list(evalues=Sigma[1:N], efunctions=Bnew%*%Eigen$vectors[,1:N])
-  rm(smooth.Gt, temp, Eigen, Sigma, d, per, N, Bnew)
+  N.Gb <- ifelse (is.null(npc), min(which(per>pve)), min(npc, length(d)))
+  smooth.Gb <- list(evalues=Sigma[1:N.Gb], efunctions=Bnew%*%Eigen$vectors[,1:N.Gb])
+  rm(smooth.Gt, temp, Eigen, Sigma, d, per, N.Gb, Bnew)
+  
   
   ###########################################################################################
   ## Estimate eigenvalues and eigenfunctions at two levels by calling the 
@@ -214,7 +339,7 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   T1.min <- min(which(argvals >= argvals[1] + 0.25 * T.len))
   T1.max <- max(which(argvals <= argvals[L] - 0.25 * T.len))
   DIAG <- (diag_Gt - cov.hat[[1]] - cov.hat[[2]])[T1.min:T1.max]
-  w2 <- quadWeights(argvals[T1.min:T1.max], method = "trapezoidal")
+  w2 <- quadWeights.mfpca(argvals[T1.min:T1.max], method = "trapezoidal")
   sigma2 <- max(weighted.mean(DIAG, w = w2, na.rm = TRUE), 0) ## estimated measurement error variance
   rm(cov.hat, T.len, T1.min, T1.max, DIAG, w2)
   
@@ -231,10 +356,10 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   score1 <- matrix(0, I, npc[[1]]) ## matrices storing scores of two levels
   score2 <- matrix(0, nrow(df$Y), npc[[2]])
   
-  unGroups <- unique(nGroups$numGroups) ## unique number of groups
-  if(length(unGroups) < I){
-    for(j in 1:length(unGroups)){
-      Jm <- unGroups[j]
+  unVisits <- unique(nVisits$numVisits) ## unique number of visits
+  if(length(unVisits) < I){
+    for(j in 1:length(unVisits)){
+      Jm <- unVisits[j]
       ## calculate block matrices
       if(sigma2 < 1e-4){
         A <- Jm * (t(phi1) %*% phi1)
@@ -254,7 +379,7 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
         }
       }
       C <- t(B)
-      invD = diag.block(temp, Jm)
+      invD <- kronecker(diag(1, Jm), temp)
       
       ## calculate inverse of each block components separately
       MatE <- ginv(A-B%*%invD%*%C)
@@ -265,7 +390,7 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
       Mat2 <- cbind(MatF,MatH)
       
       ## estimate the principal component scores using MME
-      ind.Jm <- nGroups$id[which(nGroups$numGroups == Jm)]
+      ind.Jm <- nVisits$id[which(nVisits$numVisits == Jm)]
       YJm <- matrix(df$Ytilde[which(df$id %in% ind.Jm),], ncol = L)
       int1 <- rowsum(df$Ytilde[which(df$id %in% ind.Jm),] %*% phi1, rep(1:length(ind.Jm), each = Jm))
       int2 <- t(matrix(t(df$Ytilde[which(df$id %in% ind.Jm),] %*% phi2), nrow = npc[[2]]*Jm))
@@ -273,24 +398,24 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
       if(sigma2 >= 1e-4){
         int <- int / sigma2
       }
-      score1[which(nGroups$id %in% ind.Jm),] <- int %*% t(Mat1)
+      score1[which(nVisits$id %in% ind.Jm),] <- int %*% t(Mat1)
       score2[which(df$id %in% ind.Jm),] <- t(matrix(Mat2 %*% t(int), nrow = npc[[2]]))
       
-      temp <- score1[which(nGroups$id %in% ind.Jm),] %*% t(phi1)
+      temp <- score1[which(nVisits$id %in% ind.Jm),] %*% t(phi1)
       Xhat.subject[which(df$id %in% ind.Jm),] <- temp[rep(1:length(ind.Jm), each = Jm),]
       Xhat[which(df$id %in% ind.Jm),] <- Xhat.subject[which(df$id %in% ind.Jm),] + 
         score2[which(df$id %in% ind.Jm),] %*% t(phi2)
     }
-    for(g in 1:length(levels(df$group))){
-      ind.group <- which(df$group == levels(df$group)[g])
-      Xhat.subject[ind.group,] <- t(t(Xhat.subject[ind.group,]) + mu + eta[,levels(df$group)[g]])
-      Xhat[ind.group,] <- t(t(Xhat[ind.group,]) + mu + eta[,levels(df$group)[g]])
+    for(g in 1:length(levels(df$visit))){
+      ind.visit <- which(df$visit == levels(df$visit)[g])
+      Xhat.subject[ind.visit,] <- t(t(Xhat.subject[ind.visit,]) + mu + eta[,levels(df$visit)[g]])
+      Xhat[ind.visit,] <- t(t(Xhat[ind.visit,]) + mu + eta[,levels(df$visit)[g]])
     }
-    rm(YJm, g, ind.group, ind.Jm)
+    rm(YJm, g, ind.visit, ind.Jm)
     
   }else{
     for(m in 1:I){
-      Jm <- nGroups[m, 2]  ## number of visits for mth subject
+      Jm <- nVisits[m, 2]  ## number of visits for mth subject
       ## calculate block matrices
       if(sigma2 < 1e-4){
         A <- Jm * (t(phi1) %*% phi1)
@@ -310,7 +435,7 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
         }
       }
       C <- t(B)
-      invD = diag.block(temp, Jm)
+      invD <- kronecker(diag(1, Jm), temp)
       
       ## calculate inverse of each block components separately
       MatE <- ginv(A-B%*%invD%*%C)
@@ -331,14 +456,14 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
       score1[m,] <- Mat1 %*% int
       score2[which(df$id==ID[m]),] <- matrix(Mat2 %*% int, ncol = npc[[2]], byrow=TRUE)
       for (j in which(df$id==ID[m])) {
-        Xhat.subject[j,] <- as.matrix(mu) + eta[,df$group[j]] + as.vector(phi1 %*% score1[m,])
+        Xhat.subject[j,] <- as.matrix(mu) + eta[,df$visit[j]] + as.vector(phi1 %*% score1[m,])
         Xhat[j,] <- Xhat.subject[j,] + as.vector(phi2 %*% score2[j,])
       }
     }
   }
   scores <- list(level1 = score1, level2 = score2)
   
-  rm(A, B, C, int, int1, int2, invD, Mat1, Mat2, MatE, MatF, MatG, MatH, temp, j, Jm, unGroups, phi1, phi2, score1, score2)
+  rm(A, B, C, int, int1, int2, invD, Mat1, Mat2, MatE, MatF, MatG, MatH, temp, j, Jm, unVisits, phi1, phi2, score1, score2)
   
   
   ###################################################################
@@ -346,10 +471,10 @@ mfpca.face <- function(Y, id, group = NULL, twoway = TRUE, weight = "obs", argva
   ###################################################################
   if(silent == FALSE) print("Organize the results")
   
-  res <- list(Xhat = Xhat, Xhat.subject = Xhat.subject, mu = mu, eta = eta, scores = scores, 
-              efunctions = efunctions, evalues = evalues, npc = npc, sigma2 = sigma2, Y = df$Y)
+  res <- list(Xhat = Xhat, Xhat.subject = Xhat.subject, Y = df$Y, mu = mu, eta = eta, scores = scores, 
+              efunctions = efunctions, evalues = evalues, npc = npc, sigma2 = sigma2)
   
-  rm(df, efunctions, eta, evalues, mueta, nGroups, npc, scores, Xhat, Xhat.subject, 
+  rm(df, efunctions, eta, evalues, mueta, nVisits, npc, scores, Xhat, Xhat.subject, 
      argvals, diag_Gt, I, ID, J, mu, pve, L, sigma2)
   
   return(res)
