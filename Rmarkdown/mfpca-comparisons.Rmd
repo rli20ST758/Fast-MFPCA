@@ -1,7 +1,7 @@
 ---
 title: "Fast MFPCA and MFPCA"
 author: "Erjia Cui, Ruonan Li"
-date: "9/2021"
+date: "04/2022"
 output:
   pdf_document: default
 ---
@@ -23,9 +23,10 @@ library(simex)
 library(splines)
 library(rARPACK)
 library(dplyr)
-source("./backup.R")
+setwd("~/Applications/Fast-MFPCA")
 source("./GeneData.R")
-source("./mfpca.face.R")
+# source("./face.Cov.mfpca.R")
+# source("./mfpca.face.R")
 ```
 
 ## Example 1: small data
@@ -124,7 +125,7 @@ sim_res_lite <- sim_res %>%
 sim_res_lite
 ```
 
-In this small data example, the fast MFPCA finishes calculation in less than 1 second, while the traditional MFPCA takes about 10 seconds on a regular laptop (Apple M1 processor).
+In this small data example, the fast MFPCA finishes calculation in less than 1 second, while the traditional MFPCA takes about 20 seconds on a regular laptop (Apple M1 processor).
 
 
 ## Example 2: large data
